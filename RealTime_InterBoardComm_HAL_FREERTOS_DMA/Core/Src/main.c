@@ -24,28 +24,93 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "semphr.h"
+#include "stdio.h"
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+
+typedef struct{
+  int16_t a_x;
+  int16_t a_y;
+  int16_t a_z;
+
+  int16_t g_x;
+  int16_t g_y;
+  int16_t g_z;
+
+  int16_t temp;
+  int16_t padding;
+  int longtitude;
+  int latitude;
+}readData;
+
+typedef struct{
+	uint8_t TxCmplt;
+	uint8_t RxCmplt;
+	uint8_t Handshake;
+}flags_ESP;
+
 typedef struct
 {
-	TaskHandle_t LED_Green;
-	TaskHandle_t LED_Orange;
-	TaskHandle_t LED_Red;
-	TaskHandle_t LED_Blue;
+	uint8_t ESP1_Size;
+	uint8_t ESP2_Size;
+}dataLength_ESP;
+
+typedef struct{
+	readData Data;
+	flags_ESP Flags;
+	uint8_t Size;
+	uint16_t ADDR;
+}ESP1_Ctrl;
+typedef struct{
+	readData Data;
+	flags_ESP Flags;
+	uint8_t Size;
+	uint16_t ADDR;
+}ESP2_Ctrl;
+
+
+typedef struct{
+	uint8_t TxCmplt;
+	uint8_t RxCmplt;
+	uint8_t Handshake;
+}flags_UART;
+
+typedef struct{
+	readData* Data;
+	flags_UART Flags;
+	char *USART_Handshake_msg;
+	char Rx_buff[128];
+}UART_Ctrl;
+
+typedef struct
+{
+	TaskHandle_t ESP1_DELIVERY;
+	TaskHandle_t ESP2_DELIVERY;
 }RTOS_task_struct;
 
 typedef struct
 {
 	RTOS_task_struct RTOS_Tasks;
 	SemaphoreHandle_t xMutex;
+	SemaphoreHandle_t I2CMutex;
+	SemaphoreHandle_t UARTMutex;
 }GLOBAL_struct;
+
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define DELAY 100U //in terms of miliseconds
+#define COMM_REQLENGTH 0x17U
+#define COMM_REQDATA 0x18U
+
+#define ESP1_ADDR 0x51U
+#define ESP2_ADDR 0x52U
+#define UART_HANDSHAKE_MSG "handshake"
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -58,10 +123,19 @@ I2C_HandleTypeDef hi2c1;
 DMA_HandleTypeDef hdma_i2c1_rx;
 DMA_HandleTypeDef hdma_i2c1_tx;
 
+UART_HandleTypeDef huart2;
+DMA_HandleTypeDef hdma_usart2_rx;
+DMA_HandleTypeDef hdma_usart2_tx;
+
 /* USER CODE BEGIN PV */
 
+#define UART_Text "DATA TO BE SENT OVER UART"
 GLOBAL_struct GLOBAL;
-
+ESP1_Ctrl ESP1;
+ESP2_Ctrl ESP2;
+UART_Ctrl UART2_Ctrl;
+const uint8_t Req_Length=COMM_REQLENGTH;
+const uint8_t Req_Data=COMM_REQDATA;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -69,11 +143,22 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_I2C1_Init(void);
+static void MX_USART2_UART_Init(void);
 /* USER CODE BEGIN PFP */
+void UART_Handshake(void);
+void UART_ESP1_DELIVER(void *);
+void UART_ESP2_DELIVER(void *);
+void ESP1_Handshake(void);
+void ESP2_Handshake(void);
+void READI2C_ESP1(void);
+void READI2C_ESP2(void);
+void Init_ESPS(void);
+void Init_UART(void);
 void LED_Green(void *);
 void LED_Orange(void *);
 void LED_Red(void *);
 void LED_Blue(void *);
+void read_Button(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -89,7 +174,7 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-	BaseType_t status;
+  BaseType_t status;
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -112,18 +197,33 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_I2C1_Init();
+  MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
-  GLOBAL.xMutex=xSemaphoreCreateMutex();
-  configASSERT(GLOBAL.xMutex!=NULL);
-  status=xTaskCreate(LED_Green, "Task-1", 100, 0, 2, &GLOBAL.RTOS_Tasks.LED_Green);
+
+  Init_ESPS();
+  HAL_GPIO_TogglePin(GPIOD, GPIO_PIN_12);		//WAIT UNTIL GREEN LIGHT TO CONNECT THE TX/RX LINE
+  printf("PLEASE CONNECT TXRX LINE TO ARDUINO\n");
+  while( ! HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0));	//Press the button to continue
+  HAL_Delay(500);			//Blocking delay for 500 ms
+  HAL_GPIO_TogglePin(GPIOD, GPIO_PIN_12); //TURN OFF THE GREEN LED
+  Init_UART();
+  HAL_GPIO_TogglePin(GPIOD, GPIO_PIN_12| GPIO_PIN_13|		//If UART Connection is established, all LEDS will light up until
+		  GPIO_PIN_14| GPIO_PIN_15);					//config process of RTOS tasks are over
+
+
+  GLOBAL.I2CMutex=xSemaphoreCreateMutex();
+  GLOBAL.UARTMutex=xSemaphoreCreateMutex();
+  configASSERT(GLOBAL.I2CMutex!=NULL);
+  configASSERT(GLOBAL.UARTMutex!=NULL);
+  status=xTaskCreate(UART_ESP1_DELIVER, "Task-1", 50, 0, 2, &GLOBAL.RTOS_Tasks.ESP1_DELIVERY);
   configASSERT(status);
-  status=xTaskCreate(LED_Orange, "Task-2", 100, 0, 2, &GLOBAL.RTOS_Tasks.LED_Orange);
+  status=xTaskCreate(UART_ESP2_DELIVER, "Task-2", 50, 0, 2, &GLOBAL.RTOS_Tasks.ESP1_DELIVERY);
   configASSERT(status);
-  status=xTaskCreate(LED_Red, "Task-3", 100, 0, 2, &GLOBAL.RTOS_Tasks.LED_Red);
-  configASSERT(status);
-  status=xTaskCreate(LED_Blue, "Task-4", 100, 0, 2, &GLOBAL.RTOS_Tasks.LED_Blue);
-  configASSERT(status);
+  HAL_GPIO_TogglePin(GPIOD, GPIO_PIN_12| GPIO_PIN_13|
+		  GPIO_PIN_14| GPIO_PIN_15);
   vTaskStartScheduler();
+
+  printf("Everything is good to go, press the button to continue\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -133,7 +233,6 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-
   }
   /* USER CODE END 3 */
 }
@@ -219,6 +318,39 @@ static void MX_I2C1_Init(void)
 }
 
 /**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART2_Init 0 */
+
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
+
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
+
+  /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
   * Enable DMA controller clock
   */
 static void MX_DMA_Init(void)
@@ -231,9 +363,15 @@ static void MX_DMA_Init(void)
   /* DMA1_Stream0_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
+  /* DMA1_Stream5_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream5_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream5_IRQn);
   /* DMA1_Stream6_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Stream6_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream6_IRQn);
+  /* DMA1_Stream7_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream7_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream7_IRQn);
 
 }
 
@@ -274,54 +412,212 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-void LED_Green(void *param)
+
+void I2C1_IRQ_CallBack(DMA_HandleTypeDef *hdma)
+{
+
+}
+
+void Init_ESPS(void)
+{
+	  memset((void*)&ESP1,0,sizeof(ESP1));
+	  memset((void*)&ESP2,0,sizeof(ESP2));
+
+	  ESP1.ADDR=ESP1_ADDR;
+	  ESP2.ADDR=ESP2_ADDR;
+
+	  ESP1_Handshake();
+	  ESP2_Handshake();
+}
+
+void Init_UART(void)
+{
+	memset((void*)&UART2_Ctrl,0,sizeof(UART2_Ctrl));
+	UART2_Ctrl.USART_Handshake_msg=UART_HANDSHAKE_MSG;
+	UART_Handshake();
+}
+
+void UART_ESP1_DELIVER(void *param)
 {
 	TickType_t xLastWakeTime = xTaskGetTickCount();
 	while(1)
 	{
-	xSemaphoreTake( GLOBAL.xMutex, portMAX_DELAY);
-	HAL_GPIO_TogglePin(GPIOD,GPIO_PIN_12);
-	xSemaphoreGive( GLOBAL.xMutex);
-	vTaskDelayUntil(&xLastWakeTime,pdMS_TO_TICKS(DELAY));
+		xSemaphoreTake( GLOBAL.I2CMutex, portMAX_DELAY);
+		READI2C_ESP1();
+		xSemaphoreTake( GLOBAL.UARTMutex, portMAX_DELAY);
+		HAL_UART_Transmit_DMA(&huart2, (uint8_t *)&ESP1.Data, ESP1.Size);
+		taskYIELD();
+		vTaskDelayUntil(&xLastWakeTime,pdMS_TO_TICKS(30));
 	}
 
 }
-void LED_Orange(void *param)
+
+void UART_ESP2_DELIVER(void *param)
 {
 	TickType_t xLastWakeTime = xTaskGetTickCount();
 	while(1)
 	{
-	xSemaphoreTake( GLOBAL.xMutex, portMAX_DELAY);
-	HAL_GPIO_TogglePin(GPIOD,GPIO_PIN_13);
-	xSemaphoreGive( GLOBAL.xMutex);
-	vTaskDelayUntil(&xLastWakeTime,pdMS_TO_TICKS(2*DELAY));
+		xSemaphoreTake( GLOBAL.I2CMutex, portMAX_DELAY);
+		READI2C_ESP2();
+		xSemaphoreTake( GLOBAL.UARTMutex, portMAX_DELAY);
+		HAL_UART_Transmit_DMA(&huart2, (uint8_t *)&ESP2.Data, ESP2.Size);
+		taskYIELD();
+		vTaskDelayUntil(&xLastWakeTime,pdMS_TO_TICKS(30));
 	}
-
 }
-void LED_Red(void *param)
+
+void READI2C_ESP1(void)
 {
-	TickType_t xLastWakeTime = xTaskGetTickCount();
-	while(1)
-	{
-	xSemaphoreTake( GLOBAL.xMutex, portMAX_DELAY);
-	HAL_GPIO_TogglePin(GPIOD,GPIO_PIN_14);
-	xSemaphoreGive( GLOBAL.xMutex);
-	vTaskDelayUntil(&xLastWakeTime,pdMS_TO_TICKS(3*DELAY));
-	}
-
+			while(HAL_I2C_Master_Transmit_DMA(&hi2c1, ESP1.ADDR,(uint8_t *)&Req_Data,1)!=HAL_OK);
+			while(HAL_I2C_Master_Receive_DMA(&hi2c1, ESP1.ADDR, (uint8_t *)&ESP1.Data, ESP1.Size)!=HAL_OK);
+			if(ESP1.Data.longtitude<0 || ESP1.Data.latitude<0 || ESP1.Data.temp<0)
+			{
+				configASSERT(0);		//Code error
+			}
 }
-void LED_Blue(void *param)
+
+void READI2C_ESP2(void)
 {
-	TickType_t xLastWakeTime = xTaskGetTickCount();
-	while(1)
+
+			while(HAL_I2C_Master_Transmit_DMA(&hi2c1, ESP2.ADDR,(uint8_t *)&Req_Data,1)!=HAL_OK);
+			while(HAL_I2C_Master_Receive_DMA(&hi2c1, ESP2.ADDR, (uint8_t *)&ESP2.Data, ESP2.Size)!=HAL_OK);
+			if(ESP2.Data.longtitude<0 || ESP2.Data.latitude<0 || ESP2.Data.temp<0)
+			{
+				configASSERT(0);		//Code error
+			}
+}
+
+void ESP1_Handshake(void)
+{
+		if(ESP1.Flags.Handshake==RESET)
+		{
+			while(ESP1.Flags.Handshake==RESET)
+			{
+				while(HAL_I2C_Master_Transmit_IT(&hi2c1, ESP1.ADDR, (uint8_t *)&Req_Length, 1)==HAL_BUSY);
+				while(ESP1.Flags.TxCmplt!=SET);
+
+				if(ESP1.Flags.TxCmplt==SET)
+				{
+					ESP1.Flags.Handshake=SET;
+					printf("Handshake_ESP_1 achieved with ESP32 requesting length\n");
+					ESP1.Flags.RxCmplt=RESET;
+					while(HAL_I2C_Master_Receive_IT(&hi2c1, ESP1.ADDR, &ESP1.Size, 1)==HAL_BUSY);
+					while(ESP1.Flags.RxCmplt!=SET);
+					printf("Length set %d \n", ESP1.Size);
+				}
+				ESP1.Flags.TxCmplt=RESET;
+			}
+		}
+		while(HAL_I2C_Master_Transmit_IT(&hi2c1, ESP1.ADDR, (uint8_t *)&Req_Data, 1)==HAL_BUSY);
+		while(ESP1.Flags.TxCmplt!=SET);
+		ESP1.Flags.TxCmplt=RESET;
+}
+
+void ESP2_Handshake(void)
+{
+		if(ESP2.Flags.Handshake==RESET)
+		{
+			while(ESP2.Flags.Handshake==RESET)
+			{
+				while(HAL_I2C_Master_Transmit_IT(&hi2c1, (uint16_t) ESP2.ADDR, (uint8_t *)&Req_Length, 1)==HAL_BUSY);
+				while(ESP2.Flags.TxCmplt!=SET);
+
+				if(ESP2.Flags.TxCmplt==SET)
+				{
+					ESP2.Flags.Handshake=SET;
+					printf("Handshake_ESP_2 achieved with ESP32 requesting length\n");
+					ESP2.Flags.RxCmplt=RESET;
+					while(HAL_I2C_Master_Receive_IT(&hi2c1,(uint16_t) ESP2.ADDR,&ESP2.Size,1)==HAL_BUSY);
+					while(ESP2.Flags.RxCmplt!=SET);
+					printf("Length set %d \n", ESP2.Size);
+				}
+				ESP2.Flags.TxCmplt=RESET;
+			}
+		}
+		while(HAL_I2C_Master_Transmit_IT(&hi2c1, (uint16_t) ESP2.ADDR, (uint8_t *)&Req_Data, 1)==HAL_BUSY);
+		while(ESP2.Flags.TxCmplt!=SET);
+		ESP2.Flags.TxCmplt=RESET;
+}
+
+void HAL_I2C_MasterTxCpltCallback(I2C_HandleTypeDef *hi2c)
+{
+	if(hi2c->Devaddress==0x51 && ESP1.Flags.Handshake==RESET)
 	{
-	xSemaphoreTake( GLOBAL.xMutex, portMAX_DELAY);
-	HAL_GPIO_TogglePin(GPIOD,GPIO_PIN_15);
-	xSemaphoreGive( GLOBAL.xMutex);
-	vTaskDelayUntil(&xLastWakeTime,pdMS_TO_TICKS(4*DELAY));
+		ESP1.Flags.Handshake = SET;
+		ESP1.Flags.TxCmplt=SET;
+	}else if (hi2c->Devaddress==0x52 && ESP2.Flags.Handshake==RESET)
+	{
+		ESP2.Flags.Handshake = SET;
+		ESP2.Flags.TxCmplt=SET;
 	}
+}
+
+void HAL_I2C_MasterRxCpltCallback(I2C_HandleTypeDef *hi2c)
+{
+	if(hi2c->Devaddress==0x51 && ESP1.Flags.Handshake==RESET)
+	{
+		ESP1.Flags.Handshake = SET;
+		ESP1.Flags.RxCmplt=SET;
+	}else if (hi2c->Devaddress==0x52 && ESP2.Flags.Handshake==RESET)
+	{
+		ESP2.Flags.Handshake = SET;
+		ESP2.Flags.RxCmplt=SET;
+	}else if(ESP2.Flags.Handshake==SET && ESP1.Flags.Handshake==SET)
+	{
+		BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+		xSemaphoreGiveFromISR(GLOBAL.I2CMutex,&xHigherPriorityTaskWoken);
+	}
+}
+
+void UART_Handshake(void)
+{
+	while(UART2_Ctrl.Flags.Handshake!=SET)
+	{
+		while(HAL_UART_Receive_IT(&huart2,(uint8_t *)UART2_Ctrl.Rx_buff,strlen(UART2_Ctrl.USART_Handshake_msg))==HAL_BUSY);
+
+		while(HAL_UART_Transmit_IT(&huart2,(uint8_t*)UART2_Ctrl.USART_Handshake_msg,strlen(UART2_Ctrl.USART_Handshake_msg))==HAL_BUSY);
+		//Send the msg indexed by cnt in blocking mode
+
+		while(UART2_Ctrl.Flags.TxCmplt != SET);
+		while(UART2_Ctrl.Flags.RxCmplt  != SET);
+		if(!strcmp(UART2_Ctrl.Rx_buff,UART2_Ctrl.USART_Handshake_msg))
+		{
+			printf("USART_HANDSHAKE SUCCESS\n");
+			UART2_Ctrl.Flags.Handshake=SET;
+
+		}else
+		{
+			printf("USART_HANDSHAKE FAILED\n");
+		}
+		UART2_Ctrl.Flags.TxCmplt=RESET;
+		UART2_Ctrl.Flags.RxCmplt=RESET;
+	}
+}
+
+
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+  UNUSED(huart);
+  if(UART2_Ctrl.Flags.Handshake!=SET)
+  {
+	  UART2_Ctrl.Flags.TxCmplt=SET;
+  }else{
+	  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+	  xSemaphoreGiveFromISR(GLOBAL.UARTMutex ,&xHigherPriorityTaskWoken);
+  }
 
 }
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  UNUSED(huart);
+  if(UART2_Ctrl.Flags.Handshake!=SET)
+  {
+	  UART2_Ctrl.Flags.RxCmplt=SET;
+  }
+
+}
+
 /* USER CODE END 4 */
 
 /**
