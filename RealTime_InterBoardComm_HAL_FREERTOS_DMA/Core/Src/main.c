@@ -413,10 +413,6 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
-void I2C1_IRQ_CallBack(DMA_HandleTypeDef *hdma)
-{
-
-}
 
 void Init_ESPS(void)
 {
